@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "float.h": "c",
+        "stdio.h": "c",
+        "sendfile.h": "c",
+        "netdb.h": "c",
+        "in.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
