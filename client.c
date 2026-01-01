@@ -81,6 +81,25 @@ static GC create_gc(int line_width) {
     return gc;
 }
 
+int run(GC gc) {
+
+    XEvent ev;
+    Window cur_win;
+    int init = 0;
+
+    for(;;) {
+        XNextEvent(display, &ev);
+
+        switch(ev.type) {
+            case ButtonPress:
+
+            if(ev.xbutton.button == Button1) {
+                printf("This works\n");
+            }
+        }
+    }
+}
+
 int main() {
     Window win;
     XEvent ev;
@@ -94,18 +113,22 @@ int main() {
     root = RootWindow(display, screen);
     vis = DefaultVisual(display, screen);
     Window main_win = create_win(POSX, POSY, WIDTH, HEIGHT, BORDER, root, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask, WhitePixel(display, screen));
+    Window button_win = create_win(100, 100, 100, 100, 30, main_win, ExposureMask, WhitePixel(display, screen));
 
     XMapWindow(display, main_win);
-
-    while(XNextEvent(display, &ev) == 0) {
-
-    }
+    XMapWindow(display, button_win);
 
     gc = create_gc(LINE);
     XSetForeground(display, gc, BlackPixel(display, screen));
 
+    run(gc);
+
     XUnmapWindow(display, main_win);
+    XUnmapWindow(display, button_win);
+
     XDestroyWindow(display, main_win);
+    XDestroyWindow(display, button_win);
+    
     XCloseDisplay(display);
     
     return 0;
