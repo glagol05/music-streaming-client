@@ -40,6 +40,10 @@ int artist_scroll = 0;
 int album_scroll  = 0;
 int song_scroll   = 0;
 
+int selected_artist = -1;
+int selected_album = -1;
+int selected_song = -1;
+
 
 static Display* display;
 static int screen;
@@ -80,6 +84,15 @@ struct {
     Window win;
     void (*action)(void);
 } ActionButton;
+
+typedef struct Music {
+    char title[256];
+    char album[256];
+    char artist[256];
+    char track[256];
+    char duration[256];
+    char id[256];
+} Music;
 
 typedef struct {
     Window win;
@@ -139,7 +152,7 @@ int connect_to_server(struct App *app, const char *host) {
     char s[INET6_ADDRSTRLEN];
     int status;
 
-    const char *message = "I want to connect";
+    const char *message = "test\0";
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -179,6 +192,53 @@ int connect_to_server(struct App *app, const char *host) {
     freeaddrinfo(res);
 }
 
+int get_songlist(struct App *app) {
+    struct Music songlist[100];
+    char value[256];
+    char recbuffer[1024];
+    ssize_t n;
+    int count = 0;
+
+    //send(app->sock_fd, message, strlen(message), 0);
+
+    while((n = recv(app->sock_fd, recbuffer, sizeof(recbuffer) -1, 0)) > 0) {
+        recbuffer[n] = '\0';
+        char *line = strtok(recbuffer, "\n");
+
+        while(line) {
+            if(sscanf(line, "TRACK:%255[^\n]", value) == 1) {
+                printf("Track: %s\n", value);
+                strcpy(songlist[count].title, value);
+            } else if(sscanf(line, "DURATION:%255[^\n]", value) == 1) {
+                printf("Duration: %s\n", value);
+                strcpy(songlist[count].duration, value);
+            } else if(sscanf(line, "ARTIST:%255[^\n]", value) == 1) {
+                printf("ARTIST: %s\n", value);
+                strcpy(songlist[count].artist, value);
+            } else if(sscanf(line, "ALBUM:%255[^\n]", value) == 1) {
+                printf("Album: %s\n", value);
+                strcpy(songlist[count].album, value);
+            } else if(sscanf(line, "SONG:%255[^\n]", value) == 1) {
+                printf("Title: %s\n", value);
+                strcpy(songlist[count].title, value);
+            } else if(sscanf(line, "ID:%255[^\n]", value) == 1) {
+                printf("ID: %s\n\n", value);
+                strcpy(songlist[count].id, value);
+                count++;
+            } else {
+                printf("THe song is not here or incomplete");
+            }
+
+            line = strtok(NULL, "\n");
+        }
+    }
+
+    for(int i = 0; i < count; i++) {
+        printf("Id, song, artist, album: %s, %s, %s, %s\n", songlist[i].id, songlist[i].title, songlist[i].artist, songlist[i].album);
+    }
+    close(app->sock_fd);
+}
+
 int run(struct App *app, GC gc, Artist artists[], int num_artists) {
 
     XEvent ev;
@@ -192,7 +252,19 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
         switch (ev.type) {
         case ButtonPress:
             if (ev.xbutton.button == Button1) {
-                printf("Click!\n");
+                    int click_x = ev.xbutton.x;
+                    int click_y = ev.xbutton.y;
+                    Window win = ev.xbutton.window;
+
+                    if(win == app->artist_win) {
+                        int row = (click_y + artist_scroll) / ROW_HEIGHT;
+                        if(row >= 0 && row < num_artists) {
+                            selected_artist = row;
+                            selected_album = -1;
+                            selected_song = -1;
+                            printf("Clicked on: %s\n", artists[row].name);
+                        }
+                    }
             }
 
             if (ev.xbutton.window == app->artist_win) {
@@ -316,7 +388,6 @@ int main(int argc, int **argv[]) {
 
     struct App app = {0};
 
-
     Artist artists[MAX_ARTISTS];
 
     for(int i = 0; i < MAX_ARTISTS; i++) {
@@ -365,6 +436,7 @@ int main(int argc, int **argv[]) {
     gc = create_gc(LINE);
 
     connect_to_server(&app, argv[1]);
+    get_songlist(&app);
 
     run(&app, gc, artists, MAX_ARTISTS);
 
