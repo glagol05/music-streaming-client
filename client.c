@@ -44,6 +44,18 @@ int selected_artist = -1;
 int selected_album = -1;
 int selected_song = -1;
 
+static char *xstrdup(const char *s)
+{
+    size_t len = strlen(s) + 1;
+    char *p = malloc(len);
+    if (!p) {
+        perror("malloc");
+        exit(1);
+    }
+    memcpy(p, s, len);
+    return p;
+}
+
 
 static Display* display;
 static int screen;
@@ -60,11 +72,14 @@ struct App {
     //ActionButton connect_btn;
     int sock_fd;
     int connected;
+    int num_artists;
 };
 
 typedef struct {
     char *title;
     int duration;
+    int track;
+    int id;
 } Song;
 
 typedef struct {
@@ -85,19 +100,25 @@ struct {
     void (*action)(void);
 } ActionButton;
 
-typedef struct Music {
-    char title[256];
-    char album[256];
-    char artist[256];
-    char track[256];
-    char duration[256];
-    char id[256];
-} Music;
-
 typedef struct {
     Window win;
     unsigned long value;
 } StateButton;
+
+Artist artistlist[100];
+
+static int song_cmp(const void *a, const void *b) {
+    const Song *sa = a;
+    const Song *sb = b;
+
+    if (sa->track == 0 && sb->track == 0)
+        return sa->id - sb->id;
+
+    if (sa->track == 0) return 1;
+    if (sb->track == 0) return -1;
+
+    return sa->track - sb->track;
+}
 
 void *get_in_addr(struct sockaddr *sa) {
     if(sa->sa_family == AF_INET) {
@@ -188,11 +209,12 @@ int connect_to_server(struct App *app, const char *host) {
     }
 
     send(app->sock_fd, message, strlen(message), 0);
+    return app->connected;
 
     freeaddrinfo(res);
 }
 
-int get_songlist(struct App *app) {
+/*int get_songlist(struct App *app) {
     struct Music songlist[100];
     char value[256];
     char recbuffer[1024];
@@ -237,14 +259,142 @@ int get_songlist(struct App *app) {
         printf("Id, song, artist, album: %s, %s, %s, %s\n", songlist[i].id, songlist[i].title, songlist[i].artist, songlist[i].album);
     }
     close(app->sock_fd);
+}*/
+
+void receive_metadata(int socket, struct App *app) {
+    ssize_t n;
+    char recbuffer[1024];
+    char linebuf[1024];
+    int linepos = 0;
+
+    char current_artist[256] = "";
+    char current_album[256]  = "";
+    char current_song[256]   = "";
+    int current_track = 0;
+    int current_id = -1;
+    int  duration             = 0;
+
+    int artist_counter = 0;
+
+    while ((n = recv(socket, recbuffer, sizeof(recbuffer), 0)) > 0) {
+        for (int i = 0; i < n; i++) {
+            if (recbuffer[i] == '\n') {
+                linebuf[linepos] = '\0';
+                linepos = 0;
+
+                if (strlen(linebuf) == 0)
+                    continue;
+
+                printf("DEBUG line='%s'\n", linebuf);
+
+                char value[256];
+
+                if (sscanf(linebuf, "ARTIST:%255[^\n]", value) == 1) {
+                    strcpy(current_artist, value);
+                }
+                else if (sscanf(linebuf, "ALBUM:%255[^\n]", value) == 1) {
+                    strcpy(current_album, value);
+                }
+                else if (sscanf(linebuf, "SONG:%255[^\n]", value) == 1) {
+                    strcpy(current_song, value);
+                } else if (sscanf(linebuf, "TRACK:%d", &current_track) == 1) {
+                } else if (sscanf(linebuf, "ID:%d", &current_id) == 1) {
+                }
+                else if (sscanf(linebuf, "DURATION:%d", &duration) == 1) {
+
+                    int artist_index = -1;
+                    for (int a = 0; a < artist_counter; a++) {
+                        if (strcmp(artistlist[a].name, current_artist) == 0) {
+                            artist_index = a;
+                            break;
+                        }
+                    }
+
+                    if (artist_index == -1) {
+                        artist_index = artist_counter;
+                        artistlist[artist_counter].name = xstrdup(current_artist);
+                        artistlist[artist_counter].albums = calloc(100, sizeof(Album));
+                        artistlist[artist_counter].num_albums = 0;
+                        artist_counter++;
+                    }
+
+                    Artist *a = &artistlist[artist_index];
+
+                    int album_index = -1;
+                    for (int j = 0; j < a->num_albums; j++) {
+                        if (strcmp(a->albums[j].title, current_album) == 0) {
+                            album_index = j;
+                            break;
+                        }
+                    }
+
+                    Album *al;
+
+                    if (album_index == -1) {
+                        album_index = a->num_albums;
+                        al = &a->albums[album_index];
+
+                        al->title = xstrdup(current_album);
+                        al->songs = calloc(100, sizeof(Song));
+                        al->num_songs = 0;
+
+                        a->num_albums++;
+                    } else {
+                        al = &a->albums[album_index];
+                    }
+
+                    int song_index = -1;
+                    for (int k = 0; k < al->num_songs; k++) {
+                        if (strcmp(al->songs[k].title, current_song) == 0) {
+                            song_index = k;
+                            break;
+                        }
+                    }
+
+                    if (song_index == -1) {
+                        song_index = al->num_songs;
+                        al->songs[song_index].title = xstrdup(current_song);
+                        al->songs[song_index].track = current_track;
+                        al->songs[song_index].id = current_id;
+                        al->songs[song_index].duration = duration;
+                        al->num_songs++;
+                    }
+                }
+
+            } else {
+                // accumulate byte into line buffer
+                if (linepos < sizeof(linebuf) - 1)
+                    linebuf[linepos++] = recbuffer[i];
+            }
+        }
+    }
+
+    if (n == 0)
+        printf("DEBUG: connection closed by server\n");
+    if (n < 0)
+        perror("recv");
+
+    for (int a = 0; a < artist_counter; a++) {
+        Artist *ar = &artistlist[a];
+        for (int al = 0; al < ar->num_albums; al++) {
+            Album *album = &ar->albums[al];
+            if (album->num_songs > 1) {
+                qsort(album->songs, album->num_songs, sizeof(Song), song_cmp);
+            }
+        }
+    }
+
+    app->num_artists = artist_counter;
+    close(app->sock_fd);
 }
 
-int run(struct App *app, GC gc, Artist artists[], int num_artists) {
+int request_song() {
+    
+}
+
+int run(struct App *app, GC gc, int num_artists) {
 
     XEvent ev;
-    Window cur_win;
-    int init = 0;
-
 
     for (;;) {
         XNextEvent(display, &ev);
@@ -252,19 +402,51 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
         switch (ev.type) {
         case ButtonPress:
             if (ev.xbutton.button == Button1) {
-                    int click_x = ev.xbutton.x;
-                    int click_y = ev.xbutton.y;
-                    Window win = ev.xbutton.window;
+                int click_y = ev.xbutton.y;
+                Window win = ev.xbutton.window;
 
-                    if(win == app->artist_win) {
-                        int row = (click_y + artist_scroll) / ROW_HEIGHT;
-                        if(row >= 0 && row < num_artists) {
-                            selected_artist = row;
-                            selected_album = -1;
-                            selected_song = -1;
-                            printf("Clicked on: %s\n", artists[row].name);
-                        }
+                if (win == app->artist_win) {
+                    int row = (click_y + artist_scroll) / ROW_HEIGHT;
+                    if (row >= 0 && row < num_artists) {
+                        selected_artist = row;
+                        selected_album = -1;
+                        selected_song = -1;
+
+                        XExposeEvent e;
+                        memset(&e, 0, sizeof(e));
+                        e.type = Expose;
+                        e.display = display;
+
+                        e.window = app->album_win;
+                        XSendEvent(display, app->album_win, False, ExposureMask, (XEvent *)&e);
+
+                        e.window = app->song_win;
+                        XSendEvent(display, app->song_win, False, ExposureMask, (XEvent *)&e);
                     }
+                }
+
+                if (win == app->album_win && selected_artist != -1) {
+                    int row = (click_y + album_scroll) / ROW_HEIGHT;
+                    if (row >= 0 && row < artistlist[selected_artist].num_albums) {
+                        selected_album = row;
+                        selected_song = -1;
+                        XExposeEvent e;
+                        memset(&e, 0, sizeof(e));
+                        e.type = Expose;
+                        e.display = display;
+                        e.window = app->song_win;
+                        XSendEvent(display, app->song_win, False, ExposureMask, (XEvent *)&e);
+
+                        XClearWindow(display, app->song_win);
+                    }
+                }
+
+                if (win == app->song_win && selected_artist != -1 && selected_album != -1) {
+                    int row = (click_y + song_scroll) / ROW_HEIGHT;
+                    if (row >= 0 && row < artistlist[selected_artist].albums[selected_album].num_songs) {
+                        selected_song = row;
+                    }
+                }
             }
 
             if (ev.xbutton.window == app->artist_win) {
@@ -276,7 +458,6 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 int win_height = attr.height;
                 int max_scroll = num_artists * ROW_HEIGHT - win_height;
                 if (max_scroll < 0) max_scroll = 0;
-
                 if (artist_scroll < 0) artist_scroll = 0;
                 if (artist_scroll > max_scroll) artist_scroll = max_scroll;
 
@@ -284,7 +465,7 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 for (int i = 0; i < num_artists; i++) {
                     int y = i * ROW_HEIGHT - artist_scroll;
                     if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->artist_win, gc, 5, y + 20, artists[i].name, strlen(artists[i].name));
+                    XDrawString(display, app->artist_win, gc, 5, y + 20, artistlist[i].name, strlen(artistlist[i].name));
                 }
             }
 
@@ -295,17 +476,19 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 XWindowAttributes attr;
                 XGetWindowAttributes(display, app->album_win, &attr);
                 int win_height = attr.height;
-                int max_scroll = artists[0].num_albums * ROW_HEIGHT - win_height;
+                int max_scroll = 0;
+                if (selected_artist != -1) max_scroll = artistlist[selected_artist].num_albums * ROW_HEIGHT - win_height;
                 if (max_scroll < 0) max_scroll = 0;
-
                 if (album_scroll < 0) album_scroll = 0;
                 if (album_scroll > max_scroll) album_scroll = max_scroll;
 
                 XClearWindow(display, app->album_win);
-                for (int i = 0; i < artists[0].num_albums; i++) {
-                    int y = i * ROW_HEIGHT - album_scroll;
-                    if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->album_win, gc, 5, y + 20, artists[0].albums[i].title, strlen(artists[0].albums[i].title));
+                if (selected_artist != -1) {
+                    for (int i = 0; i < artistlist[selected_artist].num_albums; i++) {
+                        int y = i * ROW_HEIGHT - album_scroll;
+                        if (y + ROW_HEIGHT < 0 || y > win_height) continue;
+                        XDrawString(display, app->album_win, gc, 5, y + 20, artistlist[selected_artist].albums[i].title, strlen(artistlist[selected_artist].albums[i].title));
+                    }
                 }
             }
 
@@ -316,17 +499,19 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 XWindowAttributes attr;
                 XGetWindowAttributes(display, app->song_win, &attr);
                 int win_height = attr.height;
-                int max_scroll = artists[0].albums[0].num_songs * ROW_HEIGHT - win_height;
+                int max_scroll = 0;
+                if (selected_artist != -1 && selected_album != -1) max_scroll = artistlist[selected_artist].albums[selected_album].num_songs * ROW_HEIGHT - win_height;
                 if (max_scroll < 0) max_scroll = 0;
-
                 if (song_scroll < 0) song_scroll = 0;
                 if (song_scroll > max_scroll) song_scroll = max_scroll;
 
                 XClearWindow(display, app->song_win);
-                for (int i = 0; i < artists[0].albums[0].num_songs; i++) {
-                    int y = i * ROW_HEIGHT - song_scroll;
-                    if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->song_win, gc, 5, y + 20, artists[0].albums[0].songs[i].title, strlen(artists[0].albums[0].songs[i].title));
+                if (selected_artist != -1 && selected_album != -1) {
+                    for (int i = 0; i < artistlist[selected_artist].albums[selected_album].num_songs; i++) {
+                        int y = i * ROW_HEIGHT - song_scroll;
+                        if (y + ROW_HEIGHT < 0 || y > win_height) continue;
+                        XDrawString(display, app->song_win, gc, 5, y + 20, artistlist[selected_artist].albums[selected_album].songs[i].title, strlen(artistlist[selected_artist].albums[selected_album].songs[i].title));
+                    }
                 }
             }
             break;
@@ -346,7 +531,7 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 for (int i = 0; i < num_artists; i++) {
                     int y = i * ROW_HEIGHT - artist_scroll;
                     if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->artist_win, gc, 5, y + 20, artists[i].name, strlen(artists[i].name));
+                    XDrawString(display, app->artist_win, gc, 5, y + 20, artistlist[i].name, strlen(artistlist[i].name));
                 }
             }
 
@@ -356,10 +541,12 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 int win_height = attr.height;
 
                 XClearWindow(display, app->album_win);
-                for (int i = 0; i < artists[0].num_albums; i++) {
-                    int y = i * ROW_HEIGHT - album_scroll;
-                    if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->album_win, gc, 5, y + 20, artists[0].albums[i].title, strlen(artists[0].albums[i].title));
+                if (selected_artist != -1) {
+                    for (int i = 0; i < artistlist[selected_artist].num_albums; i++) {
+                        int y = i * ROW_HEIGHT - album_scroll;
+                        if (y + ROW_HEIGHT < 0 || y > win_height) continue;
+                        XDrawString(display, app->album_win, gc, 5, y + 20, artistlist[selected_artist].albums[i].title, strlen(artistlist[selected_artist].albums[i].title));
+                    }
                 }
             }
 
@@ -369,10 +556,12 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
                 int win_height = attr.height;
 
                 XClearWindow(display, app->song_win);
-                for (int i = 0; i < artists[0].albums[0].num_songs; i++) {
-                    int y = i * ROW_HEIGHT - song_scroll;
-                    if (y + ROW_HEIGHT < 0 || y > win_height) continue;
-                    XDrawString(display, app->song_win, gc, 5, y + 20, artists[0].albums[0].songs[i].title, strlen(artists[0].albums[0].songs[i].title));
+                if (selected_artist != -1 && selected_album != -1) {
+                    for (int i = 0; i < artistlist[selected_artist].albums[selected_album].num_songs; i++) {
+                        int y = i * ROW_HEIGHT - song_scroll;
+                        if (y + ROW_HEIGHT < 0 || y > win_height) continue;
+                        XDrawString(display, app->song_win, gc, 5, y + 20, artistlist[selected_artist].albums[selected_album].songs[i].title, strlen(artistlist[selected_artist].albums[selected_album].songs[i].title));
+                    }
                 }
             }
             break;
@@ -381,14 +570,15 @@ int run(struct App *app, GC gc, Artist artists[], int num_artists) {
 }
 
 
-int main(int argc, int **argv[]) {
+
+int main(int argc, char *argv[]) {
     Window win;
     XEvent ev;
     GC gc;
 
     struct App app = {0};
 
-    Artist artists[MAX_ARTISTS];
+    /*Artist artists[MAX_ARTISTS];
 
     for(int i = 0; i < MAX_ARTISTS; i++) {
         artists[i].name = malloc(32);
@@ -396,7 +586,7 @@ int main(int argc, int **argv[]) {
 
         artists[i].num_albums = MAX_ALBUMS;
         artists[i].num_songs = MAX_SONGS;
-
+        
         Album *albums = malloc(sizeof(Album) * MAX_ALBUMS);
         for(int j = 0; j < MAX_ALBUMS; j++) {
             albums[j].title = malloc(32);
@@ -412,7 +602,7 @@ int main(int argc, int **argv[]) {
             albums[j].songs = songs;
         }
         artists[i].albums = albums;
-    }
+    }*/
 
     if((display = XOpenDisplay(NULL)) == NULL) {
         err(1, "Can't open display");
@@ -436,9 +626,10 @@ int main(int argc, int **argv[]) {
     gc = create_gc(LINE);
 
     connect_to_server(&app, argv[1]);
-    get_songlist(&app);
+    //get_songlist(&app);
+    receive_metadata(app.sock_fd, &app);
 
-    run(&app, gc, artists, MAX_ARTISTS);
+    run(&app, gc, app.num_artists);
 
     XUnmapWindow(display, app.main_win);
     XUnmapWindow(display, app.artist_win);
