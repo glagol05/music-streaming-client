@@ -73,6 +73,8 @@ struct App {
     int sock_fd;
     int connected;
     int num_artists;
+    char *server_host;
+    char *start_arg;
 };
 
 typedef struct {
@@ -165,15 +167,13 @@ static GC create_gc(int line_width) {
     return gc;
 }
 
-int connect_to_server(struct App *app, const char *host) {
+int connect_to_server(struct App *app, const char *host, int firstTime) {
 
     int numbytes;
     char buffer[MAXDATASIZE];
     struct addrinfo hints, *res, *p;
     char s[INET6_ADDRSTRLEN];
     int status;
-
-    const char *message = "test\0";
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -208,58 +208,14 @@ int connect_to_server(struct App *app, const char *host) {
         app->connected = 0;
     }
 
-    send(app->sock_fd, message, strlen(message), 0);
+    if(firstTime == 1){
+        send(app->sock_fd, app->start_arg, strlen(app->start_arg), 0);
+    }
+
     return app->connected;
 
     freeaddrinfo(res);
 }
-
-/*int get_songlist(struct App *app) {
-    struct Music songlist[100];
-    char value[256];
-    char recbuffer[1024];
-    ssize_t n;
-    int count = 0;
-
-    //send(app->sock_fd, message, strlen(message), 0);
-
-    while((n = recv(app->sock_fd, recbuffer, sizeof(recbuffer) -1, 0)) > 0) {
-        recbuffer[n] = '\0';
-        char *line = strtok(recbuffer, "\n");
-
-        while(line) {
-            if(sscanf(line, "TRACK:%255[^\n]", value) == 1) {
-                printf("Track: %s\n", value);
-                strcpy(songlist[count].title, value);
-            } else if(sscanf(line, "DURATION:%255[^\n]", value) == 1) {
-                printf("Duration: %s\n", value);
-                strcpy(songlist[count].duration, value);
-            } else if(sscanf(line, "ARTIST:%255[^\n]", value) == 1) {
-                printf("ARTIST: %s\n", value);
-                strcpy(songlist[count].artist, value);
-            } else if(sscanf(line, "ALBUM:%255[^\n]", value) == 1) {
-                printf("Album: %s\n", value);
-                strcpy(songlist[count].album, value);
-            } else if(sscanf(line, "SONG:%255[^\n]", value) == 1) {
-                printf("Title: %s\n", value);
-                strcpy(songlist[count].title, value);
-            } else if(sscanf(line, "ID:%255[^\n]", value) == 1) {
-                printf("ID: %s\n\n", value);
-                strcpy(songlist[count].id, value);
-                count++;
-            } else {
-                printf("THe song is not here or incomplete");
-            }
-
-            line = strtok(NULL, "\n");
-        }
-    }
-
-    for(int i = 0; i < count; i++) {
-        printf("Id, song, artist, album: %s, %s, %s, %s\n", songlist[i].id, songlist[i].title, songlist[i].artist, songlist[i].album);
-    }
-    close(app->sock_fd);
-}*/
 
 void receive_metadata(int socket, struct App *app) {
     ssize_t n;
@@ -388,8 +344,41 @@ void receive_metadata(int socket, struct App *app) {
     close(app->sock_fd);
 }
 
-int request_song() {
-    
+int request_song(int id, struct App *app) {
+    if (!connect_to_server(app, app->server_host, 0))
+        return -1;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "PLAY %d\n", id);
+    send(app->sock_fd, buf, strlen(buf), 0);
+
+    return 0;
+}
+
+int receive_song(struct App *app) {
+    ssize_t n;
+    char recbuffer[1024];
+    char message[4096];
+    size_t msg_len = 0;
+
+    //connect_to_server(&app, app->server_host);
+
+    while((n = recv(app->sock_fd, recbuffer, sizeof(recbuffer), 0)) > 0) {
+        for(ssize_t i = 0; i < n; i++) {
+            if (recbuffer[i] == '\n') {
+                message[msg_len] = '\0';
+                printf("%s\n", message);
+
+                msg_len = 0;
+                } else {
+                if (msg_len < sizeof(message) - 1) {
+                    message[msg_len++] = recbuffer[i];
+                }
+            }
+        }
+    }
+
+    close(app->sock_fd);
 }
 
 int run(struct App *app, GC gc, int num_artists) {
@@ -406,9 +395,9 @@ int run(struct App *app, GC gc, int num_artists) {
                 Window win = ev.xbutton.window;
 
                 if (win == app->artist_win) {
-                    int row = (click_y + artist_scroll) / ROW_HEIGHT;
-                    if (row >= 0 && row < num_artists) {
-                        selected_artist = row;
+                    int artist_row = (click_y + artist_scroll) / ROW_HEIGHT;
+                    if (artist_row >= 0 && artist_row < num_artists) {
+                        selected_artist = artist_row;
                         selected_album = -1;
                         selected_song = -1;
 
@@ -426,9 +415,9 @@ int run(struct App *app, GC gc, int num_artists) {
                 }
 
                 if (win == app->album_win && selected_artist != -1) {
-                    int row = (click_y + album_scroll) / ROW_HEIGHT;
-                    if (row >= 0 && row < artistlist[selected_artist].num_albums) {
-                        selected_album = row;
+                    int album_row = (click_y + album_scroll) / ROW_HEIGHT;
+                    if (album_row >= 0 && album_row < artistlist[selected_artist].num_albums) {
+                        selected_album = album_row;
                         selected_song = -1;
                         XExposeEvent e;
                         memset(&e, 0, sizeof(e));
@@ -445,6 +434,12 @@ int run(struct App *app, GC gc, int num_artists) {
                     int row = (click_y + song_scroll) / ROW_HEIGHT;
                     if (row >= 0 && row < artistlist[selected_artist].albums[selected_album].num_songs) {
                         selected_song = row;
+                        int requested_song = artistlist[selected_artist].albums[selected_album].songs[selected_song].id;
+                        printf("Selected song: %d\n", selected_song);
+                        printf("Selected song name: %s\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].title);
+                        printf("Selected song id: %d\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].id);
+                        request_song(requested_song, app);
+                        receive_song(app);
                     }
                 }
             }
@@ -577,32 +572,8 @@ int main(int argc, char *argv[]) {
     GC gc;
 
     struct App app = {0};
-
-    /*Artist artists[MAX_ARTISTS];
-
-    for(int i = 0; i < MAX_ARTISTS; i++) {
-        artists[i].name = malloc(32);
-        snprintf(artists[i].name, 32, "Artist %d", i+1);
-
-        artists[i].num_albums = MAX_ALBUMS;
-        artists[i].num_songs = MAX_SONGS;
-        
-        Album *albums = malloc(sizeof(Album) * MAX_ALBUMS);
-        for(int j = 0; j < MAX_ALBUMS; j++) {
-            albums[j].title = malloc(32);
-            snprintf(albums[j].title, 32, "Album %d-%d", i+1, j+1);
-            albums[j].num_songs = MAX_SONGS;
-
-            Song *songs = malloc(sizeof(Song) * MAX_SONGS);
-            for(int k = 0; k < MAX_SONGS; k++) {
-                songs[k].title = malloc(32);
-                snprintf(songs[k].title, 32, "Song %d-%d-%d", i+1, j+1, k+1);
-                songs[k].duration = (k+1)*30;
-            }
-            albums[j].songs = songs;
-        }
-        artists[i].albums = albums;
-    }*/
+    app.server_host = xstrdup(argv[1]);
+    app.start_arg = xstrdup(argv[2]);
 
     if((display = XOpenDisplay(NULL)) == NULL) {
         err(1, "Can't open display");
@@ -625,7 +596,7 @@ int main(int argc, char *argv[]) {
 
     gc = create_gc(LINE);
 
-    connect_to_server(&app, argv[1]);
+    connect_to_server(&app, argv[1], 1);
     //get_songlist(&app);
     receive_metadata(app.sock_fd, &app);
 
