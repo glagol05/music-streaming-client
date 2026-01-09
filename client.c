@@ -7,6 +7,9 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <mpg123.h>
+#include <alsa/asoundlib.h>
+#include <signal.h>
 
 #include <arpa/inet.h>
 
@@ -44,6 +47,8 @@ int selected_artist = -1;
 int selected_album = -1;
 int selected_song = -1;
 
+static pid_t playback_pid = -1;
+
 static char *xstrdup(const char *s)
 {
     size_t len = strlen(s) + 1;
@@ -69,6 +74,8 @@ struct App {
     Window artist_win;
     Window album_win;
     Window song_win;
+    Window musicButtons;
+    Window pauseButton;
     //ActionButton connect_btn;
     int sock_fd;
     int connected;
@@ -212,9 +219,9 @@ int connect_to_server(struct App *app, const char *host, int firstTime) {
         send(app->sock_fd, app->start_arg, strlen(app->start_arg), 0);
     }
 
-    return app->connected;
-
+    int ok = app->connected;
     freeaddrinfo(res);
+    return ok;
 }
 
 void receive_metadata(int socket, struct App *app) {
@@ -318,7 +325,6 @@ void receive_metadata(int socket, struct App *app) {
                 }
 
             } else {
-                // accumulate byte into line buffer
                 if (linepos < sizeof(linebuf) - 1)
                     linebuf[linepos++] = recbuffer[i];
             }
@@ -355,31 +361,118 @@ int request_song(int id, struct App *app) {
     return 0;
 }
 
-int receive_song(struct App *app) {
+int receive_song(struct App *app)
+{
+    unsigned char buffer[8192];
     ssize_t n;
-    char recbuffer[1024];
-    char message[4096];
-    size_t msg_len = 0;
 
-    //connect_to_server(&app, app->server_host);
+    FILE *out = fopen("song.mp3", "wb");
+    if (!out) {
+        perror("fopen");
+        return -1;
+    }
 
-    while((n = recv(app->sock_fd, recbuffer, sizeof(recbuffer), 0)) > 0) {
-        for(ssize_t i = 0; i < n; i++) {
-            if (recbuffer[i] == '\n') {
-                message[msg_len] = '\0';
-                printf("%s\n", message);
+    while ((n = recv(app->sock_fd, buffer, sizeof(buffer), 0)) > 0) {
+        fwrite(buffer, 1, n, out);
+    }
 
-                msg_len = 0;
-                } else {
-                if (msg_len < sizeof(message) - 1) {
-                    message[msg_len++] = recbuffer[i];
-                }
+    if (n < 0) {
+        perror("recv");
+        fclose(out);
+        close(app->sock_fd);
+        return -1;
+    }
+
+    fclose(out);
+    close(app->sock_fd);
+    return 0;
+}
+
+
+void play_song(const char *filepath)
+{
+    mpg123_handle *mh = NULL;
+    snd_pcm_t *pcm = NULL;
+
+    int err;
+    unsigned char buffer[4096];
+    size_t bytes_read;
+
+    long rate;
+    int channels, encoding;
+
+    mh = mpg123_new(NULL, &err);
+    if (!mh) {
+        fprintf(stderr, "mpg123_new failed: %s\n", mpg123_plain_strerror(err));
+        return;
+    }
+
+    if (mpg123_open(mh, filepath) != MPG123_OK) {
+        fprintf(stderr, "mpg123_open failed: %s\n", mpg123_strerror(mh));
+        goto cleanup;
+    }
+
+    if (mpg123_getformat(mh, &rate, &channels, &encoding) != MPG123_OK) {
+        fprintf(stderr, "mpg123_getformat failed\n");
+        goto cleanup;
+    }
+
+    mpg123_format_none(mh);
+    mpg123_format(mh, rate, channels, MPG123_ENC_SIGNED_16);
+
+    if ((err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+        fprintf(stderr, "snd_pcm_open: %s\n", snd_strerror(err));
+        goto cleanup;
+    }
+
+    if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 500000)) < 0) {
+        fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(err));
+        goto cleanup;
+    }
+
+    while (mpg123_read(mh, buffer, sizeof(buffer), &bytes_read) == MPG123_OK) {
+
+        snd_pcm_sframes_t frames = bytes_read / (channels * 2);
+        unsigned char *ptr = buffer;
+
+        while (frames > 0) {
+            snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
+
+            if (written == -EPIPE) {
+                snd_pcm_prepare(pcm);
+                continue;
+            } else if (written < 0) {
+                fprintf(stderr, "snd_pcm_writei: %s\n",
+                        snd_strerror(written));
+                goto cleanup;
             }
+
+            frames -= written;
+            ptr += written * channels * 2;
         }
     }
 
-    close(app->sock_fd);
+    snd_pcm_drain(pcm);
+
+    cleanup:
+        if (pcm)
+            snd_pcm_close(pcm);
+
+        if (mh) {
+            mpg123_close(mh);
+            mpg123_delete(mh);
+        }
 }
+
+void pause_song() {
+
+}
+
+
+void stop_song() {
+
+}
+
 
 int run(struct App *app, GC gc, int num_artists) {
 
@@ -438,8 +531,25 @@ int run(struct App *app, GC gc, int num_artists) {
                         printf("Selected song: %d\n", selected_song);
                         printf("Selected song name: %s\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].title);
                         printf("Selected song id: %d\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].id);
-                        request_song(requested_song, app);
-                        receive_song(app);
+
+                        if(playback_pid > 0) {
+                            kill(playback_pid, SIGTERM);
+                            playback_pid = -1;
+                        }
+
+                        playback_pid = fork();
+
+                        if(playback_pid == 0) {
+                            int xfd = ConnectionNumber(display);
+                            close(ConnectionNumber(display));
+
+                            request_song(requested_song, app);
+                            receive_song(app);
+                            play_song("song.mp3");
+                            _exit(0);
+                        }
+
+                        break;
                     }
                 }
             }
@@ -574,6 +684,7 @@ int main(int argc, char *argv[]) {
     struct App app = {0};
     app.server_host = xstrdup(argv[1]);
     app.start_arg = xstrdup(argv[2]);
+    mpg123_init();
 
     if((display = XOpenDisplay(NULL)) == NULL) {
         err(1, "Can't open display");
@@ -587,12 +698,20 @@ int main(int argc, char *argv[]) {
     app.artist_win = create_win(0, 0, 400, 300, 2, app.main_win, ExposureMask | ButtonPressMask, WhitePixel(display, screen));
     app.album_win  = create_win(400, 0, 400, 300, 2, app.main_win, ExposureMask| ButtonPressMask, WhitePixel(display, screen));
     app.song_win   = create_win(800, 0, 400, 300, 2, app.main_win, ExposureMask| ButtonPressMask, WhitePixel(display, screen));
+    app.musicButtons = create_win(POSX, HEIGHT-130, WIDTH, 120, 5, app.main_win, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask, WhitePixel(display, screen));
+    app.pauseButton = create_win(WIDTH / 2, 44 / 2, 30, 30, 1, app.musicButtons, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask, WhitePixel(display, screen));
+    Window nextSong = create_win(WIDTH / 2 + 50, 44 / 2, 30, 30, 1, app.musicButtons, ExposureMask, WhitePixel(display, screen));
+    Window previousSong = create_win(WIDTH / 2 - 50, 44 / 2, 30, 30, 1, app.musicButtons, ExposureMask, WhitePixel(display, screen));
     //app.button   = create_win(0, 0, 250, 200, 10, app.main_win, ExposureMask, WhitePixel(display, screen));
 
     XMapWindow(display, app.main_win);
     XMapWindow(display, app.artist_win);
     XMapWindow(display, app.album_win);
     XMapWindow(display, app.song_win);
+    XMapWindow(display, app.musicButtons);
+    XMapWindow(display, app.pauseButton);
+    XMapWindow(display, nextSong);
+    XMapWindow(display, previousSong);
 
     gc = create_gc(LINE);
 
@@ -600,17 +719,26 @@ int main(int argc, char *argv[]) {
     //get_songlist(&app);
     receive_metadata(app.sock_fd, &app);
 
+    signal(SIGCHLD, SIG_IGN);
     run(&app, gc, app.num_artists);
 
     XUnmapWindow(display, app.main_win);
     XUnmapWindow(display, app.artist_win);
     XUnmapWindow(display, app.album_win);
     XUnmapWindow(display, app.song_win);
+    XUnmapWindow(display, app.musicButtons);
+    XUnmapWindow(display, app.pauseButton);
+    XUnmapWindow(display, nextSong);
+    XUnmapWindow(display, previousSong);
 
     XDestroyWindow(display, app.main_win);
     XDestroyWindow(display, app.artist_win);
     XDestroyWindow(display, app.album_win);
     XDestroyWindow(display, app.song_win);
+    XDestroyWindow(display, app.musicButtons);
+    XDestroyWindow(display, app.pauseButton);
+    XDestroyWindow(display, nextSong);
+    XDestroyWindow(display, previousSong);
     
     XCloseDisplay(display);
 
