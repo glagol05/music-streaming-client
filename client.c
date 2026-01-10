@@ -10,6 +10,8 @@
 #include <mpg123.h>
 #include <alsa/asoundlib.h>
 #include <signal.h>
+#include <pthread.h>
+#include <X11/keysym.h>
 
 #include <arpa/inet.h>
 
@@ -46,8 +48,6 @@ int song_scroll   = 0;
 int selected_artist = -1;
 int selected_album = -1;
 int selected_song = -1;
-
-static pid_t playback_pid = -1;
 
 static char *xstrdup(const char *s)
 {
@@ -114,7 +114,16 @@ typedef struct {
     unsigned long value;
 } StateButton;
 
+struct PlaybackArgs {
+    struct App *app;
+    int song_id;
+};
+
 Artist artistlist[100];
+volatile sig_atomic_t paused = 0;
+static pthread_t playback_thread;
+static int playback_running = 0;
+static snd_pcm_t *global_pcm = NULL;
 
 static int song_cmp(const void *a, const void *b) {
     const Song *sa = a;
@@ -425,12 +434,20 @@ void play_song(const char *filepath)
         goto cleanup;
     }
 
-    if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 500000)) < 0) {
+    if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 100000)) < 0) {
         fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(err));
         goto cleanup;
     }
 
     while (mpg123_read(mh, buffer, sizeof(buffer), &bytes_read) == MPG123_OK) {
+
+        if (paused) {
+            snd_pcm_pause(pcm, 1);
+            while (paused) {
+                usleep(1000);
+            }
+            snd_pcm_pause(pcm, 0);
+        }
 
         snd_pcm_sframes_t frames = bytes_read / (channels * 2);
         unsigned char *ptr = buffer;
@@ -464,15 +481,24 @@ void play_song(const char *filepath)
         }
 }
 
-void pause_song() {
+void *playback_thread_func(void *arg)
+{
+    struct PlaybackArgs *pa = arg;
 
+    paused = 0;
+    playback_running = 1;
+
+    request_song(pa->song_id, pa->app);
+    receive_song(pa->app);
+    play_song("song.mp3");
+
+    playback_running = 0;
+    free(pa);
+    return NULL;
 }
 
-
-void stop_song() {
-
-}
-
+void pause_song(void)  { paused = 1; }
+void resume_song(void) { paused = 0; }
 
 int run(struct App *app, GC gc, int num_artists) {
 
@@ -483,6 +509,10 @@ int run(struct App *app, GC gc, int num_artists) {
 
         switch (ev.type) {
         case ButtonPress:
+            if (ev.xbutton.window == app->pauseButton) {
+                paused = !paused;
+            }
+
             if (ev.xbutton.button == Button1) {
                 int click_y = ev.xbutton.y;
                 Window win = ev.xbutton.window;
@@ -532,22 +562,18 @@ int run(struct App *app, GC gc, int num_artists) {
                         printf("Selected song name: %s\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].title);
                         printf("Selected song id: %d\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].id);
 
-                        if(playback_pid > 0) {
-                            kill(playback_pid, SIGTERM);
-                            playback_pid = -1;
+                        if (playback_running) {
+                            paused = 0;
+                            playback_running = 0;
+                            pthread_cancel(playback_thread);
+                            pthread_join(playback_thread, NULL);
                         }
 
-                        playback_pid = fork();
+                        struct PlaybackArgs *pa = malloc(sizeof(*pa));
+                        pa->app = app;
+                        pa->song_id = requested_song;
 
-                        if(playback_pid == 0) {
-                            int xfd = ConnectionNumber(display);
-                            close(ConnectionNumber(display));
-
-                            request_song(requested_song, app);
-                            receive_song(app);
-                            play_song("song.mp3");
-                            _exit(0);
-                        }
+                        pthread_create(&playback_thread, NULL, playback_thread_func, pa);
 
                         break;
                     }
@@ -621,7 +647,27 @@ int run(struct App *app, GC gc, int num_artists) {
             }
             break;
 
+        case KeyPress: {
+            KeySym keysym = XkbKeycodeToKeysym(
+                display,
+                ev.xkey.keycode,
+                0,
+                0
+            );
+
+            if (keysym == XK_space) {
+                paused = !paused;
+            }
+
+            break;
+        }
+
         case Expose:
+
+            if (ev.xexpose.window == app->main_win) {
+                XSetInputFocus(display, app->main_win, RevertToParent, CurrentTime);
+            }
+            
             if (ev.xexpose.window == app->main_win) {
                 char *message = app->connected ? "Connection successful!" : "Connection was refused";
                 XDrawString(display, app->main_win, gc, 400, 350, message, strlen(message));
@@ -719,7 +765,6 @@ int main(int argc, char *argv[]) {
     //get_songlist(&app);
     receive_metadata(app.sock_fd, &app);
 
-    signal(SIGCHLD, SIG_IGN);
     run(&app, gc, app.num_artists);
 
     XUnmapWindow(display, app.main_win);
