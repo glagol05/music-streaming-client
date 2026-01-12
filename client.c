@@ -12,6 +12,8 @@
 #include <signal.h>
 #include <pthread.h>
 #include <X11/keysym.h>
+#include <pulse/simple.h>
+#include <pulse/error.h>
 
 #include <arpa/inet.h>
 
@@ -20,8 +22,6 @@
 #include <X11/X.h>
 #include <X11/XKBlib.h>
 #include <err.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 
@@ -89,6 +89,7 @@ typedef struct {
     int duration;
     int track;
     int id;
+    char *file_path;
 } Song;
 
 typedef struct {
@@ -119,11 +120,23 @@ struct PlaybackArgs {
     int song_id;
 };
 
+Song test_song = {
+    .title = "Private Caller",
+    .duration = 0,
+    .track = 0,
+    .id = 1,
+    .file_path = "/home/user05/Music/02 - Private Caller.mp3"
+};
+
+
+
 Artist artistlist[100];
 volatile sig_atomic_t paused = 0;
+volatile sig_atomic_t stop_playback = 0;
 static pthread_t playback_thread;
 static int playback_running = 0;
 static snd_pcm_t *global_pcm = NULL;
+static int current_sock = -1;
 
 static int song_cmp(const void *a, const void *b) {
     const Song *sa = a;
@@ -359,7 +372,7 @@ void receive_metadata(int socket, struct App *app) {
     close(app->sock_fd);
 }
 
-int request_song(int id, struct App *app) {
+/*int request_song(int id, struct App *app) {
     if (!connect_to_server(app, app->server_host, 0))
         return -1;
 
@@ -368,9 +381,26 @@ int request_song(int id, struct App *app) {
     send(app->sock_fd, buf, strlen(buf), 0);
 
     return 0;
+}*/
+
+int request_song(int id, struct App *app)
+{
+    int sock;
+
+    if (!connect_to_server(app, app->server_host, 0))
+        return -1;
+
+    sock = app->sock_fd;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "PLAY %d\n", id);
+    send(sock, buf, strlen(buf), 0);
+
+    return sock;
 }
 
-int receive_song(struct App *app)
+
+/*int receive_song(struct App *app)
 {
     unsigned char buffer[8192];
     ssize_t n;
@@ -395,9 +425,10 @@ int receive_song(struct App *app)
     fclose(out);
     close(app->sock_fd);
     return 0;
-}
+}*/
 
 
+/*
 void play_song(const char *filepath)
 {
     mpg123_handle *mh = NULL;
@@ -479,23 +510,236 @@ void play_song(const char *filepath)
             mpg123_close(mh);
             mpg123_delete(mh);
         }
+}*/
+
+void stream_play(int sockfd)
+{
+    mpg123_handle *mh;
+    int err;
+    unsigned char netbuf[4096];
+    unsigned char pcmbuf[16384];
+    size_t done;
+    long rate = 0;
+    int channels = 0, encoding = 0;
+
+    pa_simple *pa = NULL;
+    int pa_error;
+
+    mh = mpg123_new(NULL, &err);
+    if(!mh){ fprintf(stderr,"[ERROR] mpg123_new failed: %s\n",mpg123_plain_strerror(err)); return; }
+
+    mpg123_format_none(mh);
+    mpg123_format(mh, 44100, 2, MPG123_ENC_SIGNED_16 | MPG123_ENC_FLOAT_32);
+
+    if(mpg123_open_feed(mh) != MPG123_OK){
+        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n",mpg123_strerror(mh));
+        mpg123_delete(mh);
+        return;
+    }
+
+    fprintf(stderr,"[DEBUG] Starting streaming loop\n");
+
+    while(!stop_playback) {
+        ssize_t n = recv(sockfd, netbuf, sizeof(netbuf), 0);
+        if(n < 0){ perror("[ERROR] recv"); break; }
+        if(n == 0){ fprintf(stderr,"[DEBUG] socket closed by server\n"); break; }
+
+        fprintf(stderr,"[DEBUG] recv %zd bytes from socket\n", n);
+        mpg123_feed(mh, netbuf, n);
+
+        for(;;){
+            if(paused){
+                usleep(1000);
+                continue;
+            }
+
+            err = mpg123_read(mh, pcmbuf, sizeof(pcmbuf), &done);
+
+            if(err == MPG123_NEW_FORMAT){
+                mpg123_getformat(mh, &rate, &channels, &encoding);
+                fprintf(stderr,"[DEBUG] NEW_FORMAT: rate=%ld channels=%d encoding=0x%x\n", rate, channels, encoding);
+
+                if(!pa) {
+                    pa_sample_spec ss;
+                    ss.format = (encoding == MPG123_ENC_FLOAT_32) ? PA_SAMPLE_FLOAT32LE : PA_SAMPLE_S16LE;
+                    ss.channels = channels;
+                    ss.rate = rate;
+
+                    pa = pa_simple_new(NULL, "MP3 Stream", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
+                    if(!pa){
+                        fprintf(stderr,"[ERROR] pa_simple_new failed: %s\n", pa_strerror(pa_error));
+                        goto out;
+                    }
+                    fprintf(stderr,"[DEBUG] PulseAudio ready (format %s)\n",
+                            (ss.format == PA_SAMPLE_FLOAT32LE) ? "FLOAT32_LE" : "S16_LE");
+                }
+                continue;
+            }
+
+            if(err == MPG123_OK || (err == MPG123_DONE && done > 0)){
+                fprintf(stderr,"[DEBUG] mpg123 read %zu bytes of PCM\n", done);
+
+                if(pa) {
+                    if(pa_simple_write(pa, pcmbuf, done, &pa_error) < 0){
+                        fprintf(stderr,"[ERROR] pa_simple_write failed: %s\n", pa_strerror(pa_error));
+                        goto out;
+                    }
+                }
+
+                if(err == MPG123_DONE) break;
+                continue;
+            }
+
+            if(err == MPG123_NEED_MORE){
+                fprintf(stderr,"[DEBUG] mpg123 needs more data\n");
+                break;
+            }
+
+            fprintf(stderr,"[ERROR] mpg123_read error: %s\n", mpg123_strerror(mh));
+            break;
+        }
+    }
+
+out:
+    if(pa){
+        pa_simple_drain(pa, &pa_error);
+        pa_simple_free(pa);
+    }
+    mpg123_delete(mh);
+    close(sockfd);
 }
+
+void stream_play_memory(const unsigned char *mp3_data, size_t mp3_size)
+{
+    mpg123_handle *mh;
+    int err;
+    unsigned char pcmbuf[16384];
+    size_t done;
+    long rate = 0;
+    int channels = 0, encoding = 0;
+
+    pa_simple *pa = NULL;
+    int pa_error;
+
+    mh = mpg123_new(NULL, &err);
+    if(!mh){
+        fprintf(stderr,"[ERROR] mpg123_new failed: %s\n",mpg123_plain_strerror(err));
+        return;
+    }
+
+    mpg123_format_none(mh);
+    mpg123_format(mh, 44100, 2, MPG123_ENC_SIGNED_16 | MPG123_ENC_FLOAT_32);
+
+    if(mpg123_open_feed(mh) != MPG123_OK){
+        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n",mpg123_strerror(mh));
+        mpg123_delete(mh);
+        return;
+    }
+
+    fprintf(stderr,"[DEBUG] Starting memory playback loop\n");
+
+    size_t offset = 0;
+
+    while(offset < mp3_size && !stop_playback) {
+        size_t chunk_size = 4096;
+        if(offset + chunk_size > mp3_size)
+            chunk_size = mp3_size - offset;
+
+        mpg123_feed(mh, mp3_data + offset, chunk_size);
+        offset += chunk_size;
+
+        for(;;) {
+            if(paused) { usleep(1000); continue; }
+
+            err = mpg123_read(mh, pcmbuf, sizeof(pcmbuf), &done);
+
+            if(err == MPG123_NEW_FORMAT){
+                mpg123_getformat(mh, &rate, &channels, &encoding);
+                fprintf(stderr,"[DEBUG] NEW_FORMAT: rate=%ld channels=%d encoding=0x%x\n", rate, channels, encoding);
+
+                if(!pa) {
+                    pa_sample_spec ss;
+                    ss.format = (encoding == MPG123_ENC_FLOAT_32) ? PA_SAMPLE_FLOAT32LE : PA_SAMPLE_S16LE;
+                    ss.channels = channels;
+                    ss.rate = rate;
+
+                    pa = pa_simple_new(NULL, "MP3 Stream", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
+                    if(!pa){
+                        fprintf(stderr,"[ERROR] pa_simple_new failed: %s\n", pa_strerror(pa_error));
+                        goto out;
+                    }
+                    fprintf(stderr,"[DEBUG] PulseAudio ready (format %s)\n",
+                            (ss.format == PA_SAMPLE_FLOAT32LE) ? "FLOAT32_LE" : "S16_LE");
+                }
+                continue;
+            }
+
+            if(err == MPG123_OK || (err == MPG123_DONE && done > 0)){
+                if(pa) {
+                    if(pa_simple_write(pa, pcmbuf, done, &pa_error) < 0){
+                        fprintf(stderr,"[ERROR] pa_simple_write failed: %s\n", pa_strerror(pa_error));
+                        goto out;
+                    }
+                }
+                if(err == MPG123_DONE) break;
+                continue;
+            }
+
+            if(err == MPG123_NEED_MORE) break;
+
+            fprintf(stderr,"[ERROR] mpg123_read error: %s\n", mpg123_strerror(mh));
+            break;
+        }
+    }
+
+out:
+    if(pa){
+        pa_simple_drain(pa, &pa_error);
+        pa_simple_free(pa);
+    }
+    mpg123_delete(mh);
+}
+
+
 
 void *playback_thread_func(void *arg)
 {
-    struct PlaybackArgs *pa = arg;
-
+    (void)arg; // unused for test
     paused = 0;
     playback_running = 1;
+    stop_playback = 0;
 
-    request_song(pa->song_id, pa->app);
-    receive_song(pa->app);
-    play_song("song.mp3");
+    // --- TEST: single hardcoded song ---
+    FILE *f = fopen(test_song.file_path, "rb");
+    if (!f) {
+        perror("[ERROR] fopen song file");
+        playback_running = 0;
+        return NULL;
+    }
 
+    fseek(f, 0, SEEK_END);
+    size_t mp3_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *mp3_data = malloc(mp3_size);
+    if (!mp3_data) {
+        fprintf(stderr, "[ERROR] malloc failed for MP3 memory\n");
+        fclose(f);
+        playback_running = 0;
+        return NULL;
+    }
+
+    fread(mp3_data, 1, mp3_size, f);
+    fclose(f);
+
+    stream_play_memory(mp3_data, mp3_size);
+
+    free(mp3_data);
     playback_running = 0;
-    free(pa);
     return NULL;
 }
+
+
 
 void pause_song(void)  { paused = 1; }
 void resume_song(void) { paused = 0; }
@@ -563,9 +807,14 @@ int run(struct App *app, GC gc, int num_artists) {
                         printf("Selected song id: %d\n", artistlist[selected_artist].albums[selected_album].songs[selected_song].id);
 
                         if (playback_running) {
-                            paused = 0;
-                            playback_running = 0;
-                            pthread_cancel(playback_thread);
+                            stop_playback = 1;
+
+                            if (current_sock != -1) {
+                                shutdown(current_sock, SHUT_RDWR);
+                                close(current_sock);
+                                current_sock = -1;
+                            }
+
                             pthread_join(playback_thread, NULL);
                         }
 
@@ -667,7 +916,7 @@ int run(struct App *app, GC gc, int num_artists) {
             if (ev.xexpose.window == app->main_win) {
                 XSetInputFocus(display, app->main_win, RevertToParent, CurrentTime);
             }
-            
+
             if (ev.xexpose.window == app->main_win) {
                 char *message = app->connected ? "Connection successful!" : "Connection was refused";
                 XDrawString(display, app->main_win, gc, 400, 350, message, strlen(message));
@@ -758,6 +1007,10 @@ int main(int argc, char *argv[]) {
     XMapWindow(display, app.pauseButton);
     XMapWindow(display, nextSong);
     XMapWindow(display, previousSong);
+
+    struct PlaybackArgs *pa = malloc(sizeof(*pa));
+    pthread_create(&playback_thread, NULL, playback_thread_func, pa);
+
 
     gc = create_gc(LINE);
 

@@ -4,10 +4,10 @@ SRC = client.c
 OBJ = client.o
 
 CFLAGS = -Wall -Wextra -std=c11 -O2 \
-	-D_POSIX_C_SOURCE=200112L \
-	$(shell pkg-config --cflags x11 xft freetype2 libmpg123 alsa)
+        -D_POSIX_C_SOURCE=200112L \
+        $(shell pkg-config --cflags x11 xft freetype2 libmpg123 libpulse-simple)
 
-LDFLAGS = $(shell pkg-config --libs x11 xft freetype2 libmpg123 alsa)
+LDFLAGS = $(shell pkg-config --libs x11 xft freetype2 libmpg123 libpulse-simple) -lpthread
 
 all: $(TARGET)
 
