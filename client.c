@@ -120,15 +120,6 @@ struct PlaybackArgs {
     int song_id;
 };
 
-Song test_song = {
-    .title = "Private Caller",
-    .duration = 0,
-    .track = 0,
-    .id = 1,
-    .file_path = "/home/user05/Music/02 - Private Caller.mp3"
-};
-
-
 
 Artist artistlist[100];
 volatile sig_atomic_t paused = 0;
@@ -244,6 +235,47 @@ int connect_to_server(struct App *app, const char *host, int firstTime) {
     int ok = app->connected;
     freeaddrinfo(res);
     return ok;
+}
+
+int connect_to_server_UDP(struct App *app, const char *host) {
+
+    struct addrinfo hints, *res, *p;
+    int rv;
+    int numbytes;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET6;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    rv = getaddrinfo(host, PORT, &hints, &res);
+    if(rv != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return 1;
+    }
+
+    for(p = res; p != NULL; p = p->ai_next) {
+        if((app->sock_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            perror("talker: socket");
+            continue;
+        }
+        break;
+    }
+
+    if (p == NULL) {
+        fprintf(stderr, "talker: failed to create socket\n");
+        return 2;
+    }
+
+    if ((numbytes = sendto(app->sock_fd, app->start_arg, strlen(app->start_arg), 0, p->ai_addr, p->ai_addrlen)) == -1) {
+        perror("sendto");
+        freeaddrinfo(res);
+        return 3;
+    }
+
+    printf("sent %d bytes to %s\n", numbytes, host);
+
+    freeaddrinfo(res);
+    return 0;
 }
 
 void receive_metadata(int socket, struct App *app) {
@@ -385,134 +417,50 @@ void receive_metadata(int socket, struct App *app) {
 
 int request_song(int id, struct App *app)
 {
+    struct addrinfo hints, *res, *p;
     int sock;
+    int rv;
 
-    if (!connect_to_server(app, app->server_host, 0))
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    if ((rv = getaddrinfo(app->server_host, PORT, &hints, &res)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
         return -1;
+    }
 
-    sock = app->sock_fd;
+    for (p = res; p != NULL; p = p->ai_next) {
+        if ((sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            perror("socket");
+            continue;
+        }
+        break;
+    }
+
+    if (p == NULL) {
+        fprintf(stderr, "failed to create UDP socket\n");
+        freeaddrinfo(res);
+        return -1;
+    }
 
     char buf[64];
     snprintf(buf, sizeof(buf), "PLAY %d\n", id);
-    send(sock, buf, strlen(buf), 0);
 
+    ssize_t sent = sendto(sock, buf, strlen(buf), 0, p->ai_addr, p->ai_addrlen);
+    if (sent < 0) {
+        perror("sendto PLAY");
+        close(sock);
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    freeaddrinfo(res);
+    app->sock_fd = sock;
     return sock;
 }
 
-
-/*int receive_song(struct App *app)
-{
-    unsigned char buffer[8192];
-    ssize_t n;
-
-    FILE *out = fopen("song.mp3", "wb");
-    if (!out) {
-        perror("fopen");
-        return -1;
-    }
-
-    while ((n = recv(app->sock_fd, buffer, sizeof(buffer), 0)) > 0) {
-        fwrite(buffer, 1, n, out);
-    }
-
-    if (n < 0) {
-        perror("recv");
-        fclose(out);
-        close(app->sock_fd);
-        return -1;
-    }
-
-    fclose(out);
-    close(app->sock_fd);
-    return 0;
-}*/
-
-
-/*
-void play_song(const char *filepath)
-{
-    mpg123_handle *mh = NULL;
-    snd_pcm_t *pcm = NULL;
-
-    int err;
-    unsigned char buffer[4096];
-    size_t bytes_read;
-
-    long rate;
-    int channels, encoding;
-
-    mh = mpg123_new(NULL, &err);
-    if (!mh) {
-        fprintf(stderr, "mpg123_new failed: %s\n", mpg123_plain_strerror(err));
-        return;
-    }
-
-    if (mpg123_open(mh, filepath) != MPG123_OK) {
-        fprintf(stderr, "mpg123_open failed: %s\n", mpg123_strerror(mh));
-        goto cleanup;
-    }
-
-    if (mpg123_getformat(mh, &rate, &channels, &encoding) != MPG123_OK) {
-        fprintf(stderr, "mpg123_getformat failed\n");
-        goto cleanup;
-    }
-
-    mpg123_format_none(mh);
-    mpg123_format(mh, rate, channels, MPG123_ENC_SIGNED_16);
-
-    if ((err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-        fprintf(stderr, "snd_pcm_open: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-
-    if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels, rate, 1, 100000)) < 0) {
-        fprintf(stderr, "snd_pcm_set_params: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-
-    while (mpg123_read(mh, buffer, sizeof(buffer), &bytes_read) == MPG123_OK) {
-
-        if (paused) {
-            snd_pcm_pause(pcm, 1);
-            while (paused) {
-                usleep(1000);
-            }
-            snd_pcm_pause(pcm, 0);
-        }
-
-        snd_pcm_sframes_t frames = bytes_read / (channels * 2);
-        unsigned char *ptr = buffer;
-
-        while (frames > 0) {
-            snd_pcm_sframes_t written = snd_pcm_writei(pcm, ptr, frames);
-
-            if (written == -EPIPE) {
-                snd_pcm_prepare(pcm);
-                continue;
-            } else if (written < 0) {
-                fprintf(stderr, "snd_pcm_writei: %s\n",
-                        snd_strerror(written));
-                goto cleanup;
-            }
-
-            frames -= written;
-            ptr += written * channels * 2;
-        }
-    }
-
-    snd_pcm_drain(pcm);
-
-    cleanup:
-        if (pcm)
-            snd_pcm_close(pcm);
-
-        if (mh) {
-            mpg123_close(mh);
-            mpg123_delete(mh);
-        }
-}*/
-
-void stream_play(int sockfd)
+void stream_play_udp(int sockfd)
 {
     mpg123_handle *mh;
     int err;
@@ -525,48 +473,60 @@ void stream_play(int sockfd)
     pa_simple *pa = NULL;
     int pa_error;
 
+    struct sockaddr_storage src_addr;
+    socklen_t addrlen = sizeof(src_addr);
+
+    // Initialize mpg123
     mh = mpg123_new(NULL, &err);
-    if(!mh){ fprintf(stderr,"[ERROR] mpg123_new failed: %s\n",mpg123_plain_strerror(err)); return; }
+    if (!mh) {
+        fprintf(stderr,"[ERROR] mpg123_new failed: %s\n", mpg123_plain_strerror(err));
+        return;
+    }
 
     mpg123_format_none(mh);
     mpg123_format(mh, 44100, 2, MPG123_ENC_SIGNED_16 | MPG123_ENC_FLOAT_32);
 
-    if(mpg123_open_feed(mh) != MPG123_OK){
-        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n",mpg123_strerror(mh));
+    if (mpg123_open_feed(mh) != MPG123_OK) {
+        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n", mpg123_strerror(mh));
         mpg123_delete(mh);
         return;
     }
 
-    fprintf(stderr,"[DEBUG] Starting streaming loop\n");
+    fprintf(stderr,"[DEBUG] Starting UDP streaming loop\n");
 
-    while(!stop_playback) {
-        ssize_t n = recv(sockfd, netbuf, sizeof(netbuf), 0);
-        if(n < 0){ perror("[ERROR] recv"); break; }
-        if(n == 0){ fprintf(stderr,"[DEBUG] socket closed by server\n"); break; }
+    while (!stop_playback) {
+        ssize_t n = recvfrom(sockfd, netbuf, sizeof(netbuf), 0,
+                             (struct sockaddr *)&src_addr, &addrlen);
+        if (n < 0) {
+            perror("[ERROR] recvfrom");
+            break;
+        }
+        if (n == 0) {
+            fprintf(stderr,"[DEBUG] received empty UDP packet\n");
+            continue;
+        }
 
-        fprintf(stderr,"[DEBUG] recv %zd bytes from socket\n", n);
         mpg123_feed(mh, netbuf, n);
 
-        for(;;){
-            if(paused){
+        for (;;) {
+            if (paused) {
                 usleep(1000);
                 continue;
             }
 
             err = mpg123_read(mh, pcmbuf, sizeof(pcmbuf), &done);
 
-            if(err == MPG123_NEW_FORMAT){
+            if (err == MPG123_NEW_FORMAT) {
                 mpg123_getformat(mh, &rate, &channels, &encoding);
-                fprintf(stderr,"[DEBUG] NEW_FORMAT: rate=%ld channels=%d encoding=0x%x\n", rate, channels, encoding);
 
-                if(!pa) {
+                if (!pa) {
                     pa_sample_spec ss;
                     ss.format = (encoding == MPG123_ENC_FLOAT_32) ? PA_SAMPLE_FLOAT32LE : PA_SAMPLE_S16LE;
                     ss.channels = channels;
                     ss.rate = rate;
 
-                    pa = pa_simple_new(NULL, "MP3 Stream", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
-                    if(!pa){
+                    pa = pa_simple_new(NULL, "MP3 Stream UDP", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
+                    if (!pa) {
                         fprintf(stderr,"[ERROR] pa_simple_new failed: %s\n", pa_strerror(pa_error));
                         goto out;
                     }
@@ -576,23 +536,20 @@ void stream_play(int sockfd)
                 continue;
             }
 
-            if(err == MPG123_OK || (err == MPG123_DONE && done > 0)){
-                fprintf(stderr,"[DEBUG] mpg123 read %zu bytes of PCM\n", done);
-
-                if(pa) {
-                    if(pa_simple_write(pa, pcmbuf, done, &pa_error) < 0){
+            if (err == MPG123_OK || (err == MPG123_DONE && done > 0)) {
+                if (pa) {
+                    if (pa_simple_write(pa, pcmbuf, done, &pa_error) < 0) {
                         fprintf(stderr,"[ERROR] pa_simple_write failed: %s\n", pa_strerror(pa_error));
                         goto out;
                     }
                 }
 
-                if(err == MPG123_DONE) break;
+                if (err == MPG123_DONE) break;
                 continue;
             }
 
-            if(err == MPG123_NEED_MORE){
-                fprintf(stderr,"[DEBUG] mpg123 needs more data\n");
-                break;
+            if (err == MPG123_NEED_MORE) {
+                break; // wait for next UDP packet
             }
 
             fprintf(stderr,"[ERROR] mpg123_read error: %s\n", mpg123_strerror(mh));
@@ -601,7 +558,7 @@ void stream_play(int sockfd)
     }
 
 out:
-    if(pa){
+    if (pa) {
         pa_simple_drain(pa, &pa_error);
         pa_simple_free(pa);
     }
@@ -609,133 +566,25 @@ out:
     close(sockfd);
 }
 
-void stream_play_memory(const unsigned char *mp3_data, size_t mp3_size)
-{
-    mpg123_handle *mh;
-    int err;
-    unsigned char pcmbuf[16384];
-    size_t done;
-    long rate = 0;
-    int channels = 0, encoding = 0;
-
-    pa_simple *pa = NULL;
-    int pa_error;
-
-    mh = mpg123_new(NULL, &err);
-    if(!mh){
-        fprintf(stderr,"[ERROR] mpg123_new failed: %s\n",mpg123_plain_strerror(err));
-        return;
-    }
-
-    mpg123_format_none(mh);
-    mpg123_format(mh, 44100, 2, MPG123_ENC_SIGNED_16 | MPG123_ENC_FLOAT_32);
-
-    if(mpg123_open_feed(mh) != MPG123_OK){
-        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n",mpg123_strerror(mh));
-        mpg123_delete(mh);
-        return;
-    }
-
-    fprintf(stderr,"[DEBUG] Starting memory playback loop\n");
-
-    size_t offset = 0;
-
-    while(offset < mp3_size && !stop_playback) {
-        size_t chunk_size = 4096;
-        if(offset + chunk_size > mp3_size)
-            chunk_size = mp3_size - offset;
-
-        mpg123_feed(mh, mp3_data + offset, chunk_size);
-        offset += chunk_size;
-
-        for(;;) {
-            if(paused) { usleep(1000); continue; }
-
-            err = mpg123_read(mh, pcmbuf, sizeof(pcmbuf), &done);
-
-            if(err == MPG123_NEW_FORMAT){
-                mpg123_getformat(mh, &rate, &channels, &encoding);
-                fprintf(stderr,"[DEBUG] NEW_FORMAT: rate=%ld channels=%d encoding=0x%x\n", rate, channels, encoding);
-
-                if(!pa) {
-                    pa_sample_spec ss;
-                    ss.format = (encoding == MPG123_ENC_FLOAT_32) ? PA_SAMPLE_FLOAT32LE : PA_SAMPLE_S16LE;
-                    ss.channels = channels;
-                    ss.rate = rate;
-
-                    pa = pa_simple_new(NULL, "MP3 Stream", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
-                    if(!pa){
-                        fprintf(stderr,"[ERROR] pa_simple_new failed: %s\n", pa_strerror(pa_error));
-                        goto out;
-                    }
-                    fprintf(stderr,"[DEBUG] PulseAudio ready (format %s)\n",
-                            (ss.format == PA_SAMPLE_FLOAT32LE) ? "FLOAT32_LE" : "S16_LE");
-                }
-                continue;
-            }
-
-            if(err == MPG123_OK || (err == MPG123_DONE && done > 0)){
-                if(pa) {
-                    if(pa_simple_write(pa, pcmbuf, done, &pa_error) < 0){
-                        fprintf(stderr,"[ERROR] pa_simple_write failed: %s\n", pa_strerror(pa_error));
-                        goto out;
-                    }
-                }
-                if(err == MPG123_DONE) break;
-                continue;
-            }
-
-            if(err == MPG123_NEED_MORE) break;
-
-            fprintf(stderr,"[ERROR] mpg123_read error: %s\n", mpg123_strerror(mh));
-            break;
-        }
-    }
-
-out:
-    if(pa){
-        pa_simple_drain(pa, &pa_error);
-        pa_simple_free(pa);
-    }
-    mpg123_delete(mh);
-}
-
-
 
 void *playback_thread_func(void *arg)
 {
-    (void)arg; // unused for test
+    struct PlaybackArgs *pa = arg;
+    if (!pa) return NULL;
+
     paused = 0;
-    playback_running = 1;
     stop_playback = 0;
+    playback_running = 1;
 
-    // --- TEST: single hardcoded song ---
-    FILE *f = fopen(test_song.file_path, "rb");
-    if (!f) {
-        perror("[ERROR] fopen song file");
-        playback_running = 0;
-        return NULL;
+    int sock = request_song(pa->song_id, pa->app);
+    if (sock >= 0) {
+        current_sock = sock;
+        stream_play_udp(sock);
+        current_sock = -1;
     }
 
-    fseek(f, 0, SEEK_END);
-    size_t mp3_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    unsigned char *mp3_data = malloc(mp3_size);
-    if (!mp3_data) {
-        fprintf(stderr, "[ERROR] malloc failed for MP3 memory\n");
-        fclose(f);
-        playback_running = 0;
-        return NULL;
-    }
-
-    fread(mp3_data, 1, mp3_size, f);
-    fclose(f);
-
-    stream_play_memory(mp3_data, mp3_size);
-
-    free(mp3_data);
     playback_running = 0;
+    free(pa);
     return NULL;
 }
 
@@ -1007,10 +856,6 @@ int main(int argc, char *argv[]) {
     XMapWindow(display, app.pauseButton);
     XMapWindow(display, nextSong);
     XMapWindow(display, previousSong);
-
-    struct PlaybackArgs *pa = malloc(sizeof(*pa));
-    pthread_create(&playback_thread, NULL, playback_thread_func, pa);
-
 
     gc = create_gc(LINE);
 
