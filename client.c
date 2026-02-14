@@ -41,6 +41,33 @@
 
 #define ROW_HEIGHT 30
 
+#define RTP_HEADER_SIZE 12
+
+#define CHUNK_SIZE 4096
+#define BUFFER_PACKETS 800
+#define PLAYBACK_DELAY_MS 100
+#define SAMPLE_RATE 44100
+
+typedef struct {
+    uint16_t seq;
+    uint32_t ts;
+    size_t size;
+    uint8_t data[CHUNK_SIZE];
+} rtp_packet_t;
+
+typedef struct {
+    rtp_packet_t packets[BUFFER_PACKETS];
+    int count;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} jitter_buffer_t;
+
+jitter_buffer_t jitter_buffer = {
+    .count = 0,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER
+};
+
 int artist_scroll = 0;
 int album_scroll  = 0;
 int song_scroll   = 0;
@@ -120,6 +147,14 @@ struct PlaybackArgs {
     int song_id;
 };
 
+typedef struct __attribute__((packed)) {
+    uint8_t vpxcc;
+    uint8_t mpt;
+    uint16_t seq;
+    uint32_t ts;
+    uint32_t ssrc;
+} rtp_header_t;
+
 
 Artist artistlist[100];
 volatile sig_atomic_t paused = 0;
@@ -127,7 +162,6 @@ volatile sig_atomic_t stop_playback = 0;
 static pthread_t playback_thread;
 static int playback_running = 0;
 static snd_pcm_t *global_pcm = NULL;
-static int current_sock = -1;
 
 static int song_cmp(const void *a, const void *b) {
     const Song *sa = a;
@@ -196,7 +230,7 @@ int connect_to_server(struct App *app, const char *host, int firstTime) {
     int status;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
     if((status = getaddrinfo(host, PORT, &hints, &res)) != 0) {
@@ -224,7 +258,6 @@ int connect_to_server(struct App *app, const char *host, int firstTime) {
 
     if(p == NULL) {
         fprintf(stderr, "client: failed to connect");
-        //return 2;
         app->connected = 0;
     }
 
@@ -244,7 +277,7 @@ int connect_to_server_UDP(struct App *app, const char *host) {
     int numbytes;
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET6;
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
 
     rv = getaddrinfo(host, PORT, &hints, &res);
@@ -415,183 +448,252 @@ void receive_metadata(int socket, struct App *app) {
     return 0;
 }*/
 
-int request_song(int id, struct App *app)
+static int get_udp_port(int sock)
 {
-    struct addrinfo hints, *res, *p;
-    int sock;
-    int rv;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    if ((rv = getaddrinfo(app->server_host, PORT, &hints, &res)) != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(sock, (struct sockaddr*)&addr, &len) < 0) {
+        perror("getsockname");
         return -1;
     }
+    return ntohs(addr.sin_port);
+}
 
-    for (p = res; p != NULL; p = p->ai_next) {
-        if ((sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-            perror("socket");
-            continue;
-        }
-        break;
-    }
-
-    if (p == NULL) {
-        fprintf(stderr, "failed to create UDP socket\n");
-        freeaddrinfo(res);
+int request_song(int id, struct App *app, int udp_port)
+{
+    if (!connect_to_server(app, app->server_host, 0))
         return -1;
-    }
 
     char buf[64];
-    snprintf(buf, sizeof(buf), "PLAY %d\n", id);
+    snprintf(buf, sizeof(buf), "PLAY %d %d\n", id, udp_port);
 
-    ssize_t sent = sendto(sock, buf, strlen(buf), 0, p->ai_addr, p->ai_addrlen);
-    if (sent < 0) {
-        perror("sendto PLAY");
-        close(sock);
-        freeaddrinfo(res);
+    if (send(app->sock_fd, buf, strlen(buf), 0) < 0) {
+        perror("send PLAY");
+        close(app->sock_fd);
         return -1;
     }
 
-    freeaddrinfo(res);
-    app->sock_fd = sock;
-    return sock;
+    close(app->sock_fd);
+    return 0;
 }
 
-void stream_play_udp(int sockfd)
+void add_packet(rtp_packet_t *pkt){
+    pthread_mutex_lock(&jitter_buffer.lock);
+    if(jitter_buffer.count < BUFFER_PACKETS){
+        jitter_buffer.packets[jitter_buffer.count++] = *pkt;
+        pthread_cond_signal(&jitter_buffer.cond);
+    }
+    pthread_mutex_unlock(&jitter_buffer.lock);
+}
+
+int compare_seq(const void *a,const void *b){
+    return ((rtp_packet_t*)a)->seq - ((rtp_packet_t*)b)->seq;
+}
+
+rtp_packet_t get_next_packet()
 {
-    mpg123_handle *mh;
-    int err;
-    unsigned char netbuf[4096];
-    unsigned char pcmbuf[16384];
-    size_t done;
-    long rate = 0;
-    int channels = 0, encoding = 0;
+    rtp_packet_t pkt = {0};
+    pthread_mutex_lock(&jitter_buffer.lock);
 
-    pa_simple *pa = NULL;
-    int pa_error;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
 
-    struct sockaddr_storage src_addr;
-    socklen_t addrlen = sizeof(src_addr);
-
-    // Initialize mpg123
-    mh = mpg123_new(NULL, &err);
-    if (!mh) {
-        fprintf(stderr,"[ERROR] mpg123_new failed: %s\n", mpg123_plain_strerror(err));
-        return;
+    ts.tv_nsec += 10 * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
     }
 
-    mpg123_format_none(mh);
-    mpg123_format(mh, 44100, 2, MPG123_ENC_SIGNED_16 | MPG123_ENC_FLOAT_32);
+    /*while (jitter_buffer.count == 0 && !stop_playback) {
+        if (pthread_cond_timedwait(&jitter_buffer.cond, &jitter_buffer.lock, &ts) == ETIMEDOUT) {
 
-    if (mpg123_open_feed(mh) != MPG123_OK) {
-        fprintf(stderr,"[ERROR] mpg123_open_feed failed: %s\n", mpg123_strerror(mh));
-        mpg123_delete(mh);
-        return;
+            stop_playback = 1;
+            pthread_mutex_unlock(&jitter_buffer.lock);
+            return pkt;
+        }
+    }*/
+
+    while (jitter_buffer.count == 0 && !stop_playback) {
+        pthread_cond_wait(&jitter_buffer.cond, &jitter_buffer.lock);
     }
 
-    fprintf(stderr,"[DEBUG] Starting UDP streaming loop\n");
+    if (stop_playback) {
+        pthread_mutex_unlock(&jitter_buffer.lock);
+        return pkt;
+    }
+
+    qsort(jitter_buffer.packets, jitter_buffer.count, sizeof(rtp_packet_t), compare_seq);
+
+    pkt = jitter_buffer.packets[0];
+    memmove(&jitter_buffer.packets[0],
+            &jitter_buffer.packets[1],
+            sizeof(rtp_packet_t) * (--jitter_buffer.count));
+
+    pthread_mutex_unlock(&jitter_buffer.lock);
+    return pkt;
+}
+
+void *recv_thread(void *arg)
+{
+    int sock = *(int *)arg;
+    uint8_t buffer[CHUNK_SIZE + RTP_HEADER_SIZE];
 
     while (!stop_playback) {
-        ssize_t n = recvfrom(sockfd, netbuf, sizeof(netbuf), 0,
-                             (struct sockaddr *)&src_addr, &addrlen);
-        if (n < 0) {
-            perror("[ERROR] recvfrom");
+        fd_set rfds;
+        struct timeval tv;
+
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+
+        tv.tv_sec = 0;
+        tv.tv_usec = 200 * 1000;
+
+        int ret = select(sock + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("select");
             break;
         }
-        if (n == 0) {
-            fprintf(stderr,"[DEBUG] received empty UDP packet\n");
+
+        if (ret == 0)
             continue;
-        }
 
-        mpg123_feed(mh, netbuf, n);
+        ssize_t n = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
+        if (n <= RTP_HEADER_SIZE)
+            continue;
 
-        for (;;) {
-            if (paused) {
-                usleep(1000);
-                continue;
-            }
+        rtp_packet_t pkt;
+        pkt.seq  = ntohs(*(uint16_t *)(buffer + 2));
+        pkt.ts   = ntohl(*(uint32_t *)(buffer + 4));
+        pkt.size = n - RTP_HEADER_SIZE;
+        memcpy(pkt.data, buffer + RTP_HEADER_SIZE, pkt.size);
 
-            err = mpg123_read(mh, pcmbuf, sizeof(pcmbuf), &done);
-
-            if (err == MPG123_NEW_FORMAT) {
-                mpg123_getformat(mh, &rate, &channels, &encoding);
-
-                if (!pa) {
-                    pa_sample_spec ss;
-                    ss.format = (encoding == MPG123_ENC_FLOAT_32) ? PA_SAMPLE_FLOAT32LE : PA_SAMPLE_S16LE;
-                    ss.channels = channels;
-                    ss.rate = rate;
-
-                    pa = pa_simple_new(NULL, "MP3 Stream UDP", PA_STREAM_PLAYBACK, NULL, "Music", &ss, NULL, NULL, &pa_error);
-                    if (!pa) {
-                        fprintf(stderr,"[ERROR] pa_simple_new failed: %s\n", pa_strerror(pa_error));
-                        goto out;
-                    }
-                    fprintf(stderr,"[DEBUG] PulseAudio ready (format %s)\n",
-                            (ss.format == PA_SAMPLE_FLOAT32LE) ? "FLOAT32_LE" : "S16_LE");
-                }
-                continue;
-            }
-
-            if (err == MPG123_OK || (err == MPG123_DONE && done > 0)) {
-                if (pa) {
-                    if (pa_simple_write(pa, pcmbuf, done, &pa_error) < 0) {
-                        fprintf(stderr,"[ERROR] pa_simple_write failed: %s\n", pa_strerror(pa_error));
-                        goto out;
-                    }
-                }
-
-                if (err == MPG123_DONE) break;
-                continue;
-            }
-
-            if (err == MPG123_NEED_MORE) {
-                break; // wait for next UDP packet
-            }
-
-            fprintf(stderr,"[ERROR] mpg123_read error: %s\n", mpg123_strerror(mh));
-            break;
-        }
+        add_packet(&pkt);
     }
 
-out:
-    if (pa) {
-        pa_simple_drain(pa, &pa_error);
-        pa_simple_free(pa);
-    }
-    mpg123_delete(mh);
-    close(sockfd);
+    return NULL;
 }
 
+uint64_t current_time_ms(){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return ts.tv_sec*1000 + ts.tv_nsec/1000000;
+}
+
+void stream_play_udp(int sockfd, struct sockaddr_in server_addr)
+{
+    
+}
 
 void *playback_thread_func(void *arg)
 {
     struct PlaybackArgs *pa = arg;
-    if (!pa) return NULL;
+    struct App *app = pa->app;
+    int song_id = pa->song_id;
+    free(pa);
 
-    paused = 0;
-    stop_playback = 0;
-    playback_running = 1;
-
-    int sock = request_song(pa->song_id, pa->app);
-    if (sock >= 0) {
-        current_sock = sock;
-        stream_play_udp(sock);
-        current_sock = -1;
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("UDP socket creation failed");
+        return NULL;
     }
 
+    struct sockaddr_in client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_addr.s_addr = INADDR_ANY;
+    client_addr.sin_port = htons(0);
+
+    if (bind(udp_sock, (struct sockaddr*)&client_addr, sizeof(client_addr)) < 0) {
+        perror("UDP bind failed");
+        close(udp_sock);
+        return NULL;
+    }
+
+    socklen_t len = sizeof(client_addr);
+    getsockname(udp_sock, (struct sockaddr*)&client_addr, &len);
+    int udp_port = ntohs(client_addr.sin_port);
+
+    playback_running = 1;
+    stop_playback = 0;
+
+    pthread_mutex_lock(&jitter_buffer.lock);
+    jitter_buffer.count = 0;
+    pthread_mutex_unlock(&jitter_buffer.lock);
+
+    if (request_song(song_id, app, udp_port) < 0) {
+        playback_running = 0;
+        return NULL;
+    }
+
+    FILE *player = popen(
+        "aplay -f S16_LE -c 2 -r 44100 "
+        "--buffer-time=500000 "
+        "--period-time=100000 "
+        "--disable-resample "
+        "--disable-softvol",
+        "w"
+    );
+
+    if (!player) {
+        playback_running = 0;
+        return NULL;
+    }
+
+    pthread_t recv_tid;
+    pthread_create(&recv_tid, NULL, recv_thread, &udp_sock);
+
+    while (1) {
+        pthread_mutex_lock(&jitter_buffer.lock);
+        int buffered = jitter_buffer.count;
+        pthread_mutex_unlock(&jitter_buffer.lock);
+
+        if (buffered >= 30)
+            break;
+
+        usleep(1000);
+    }
+
+    while (!stop_playback) {
+
+        if (paused) {
+            usleep(10 * 1000);
+            continue;
+        }
+
+        rtp_packet_t pkt = get_next_packet();
+        if (stop_playback)
+            break;
+
+        if (pkt.size > 0) {
+            fwrite(pkt.data, 1, pkt.size, player);
+        }
+    }
+
+    stop_playback = 1;
+
+    pthread_mutex_lock(&jitter_buffer.lock);
+    pthread_cond_broadcast(&jitter_buffer.cond);
+    pthread_mutex_unlock(&jitter_buffer.lock);
+
+    pthread_join(recv_tid, NULL);
+    close(udp_sock);
+
+    pclose(player);
     playback_running = 0;
-    free(pa);
     return NULL;
 }
 
-
-
 void pause_song(void)  { paused = 1; }
-void resume_song(void) { paused = 0; }
+void resume_song(void) {
+    paused = 0;
+
+    /* Flush stale RTP packets to avoid ALSA underrun burst 
+    pthread_mutex_lock(&jitter_buffer.lock);
+    jitter_buffer.count = 0;
+    pthread_mutex_unlock(&jitter_buffer.lock);*/
+}
 
 int run(struct App *app, GC gc, int num_artists) {
 
@@ -657,14 +759,16 @@ int run(struct App *app, GC gc, int num_artists) {
 
                         if (playback_running) {
                             stop_playback = 1;
-
-                            if (current_sock != -1) {
-                                shutdown(current_sock, SHUT_RDWR);
-                                close(current_sock);
-                                current_sock = -1;
-                            }
-
                             pthread_join(playback_thread, NULL);
+
+                            paused = 0;
+
+                            pthread_mutex_lock(&jitter_buffer.lock);
+                            jitter_buffer.count = 0;
+                            pthread_mutex_unlock(&jitter_buffer.lock);
+
+                            /*uint8_t drain[2048];
+                            while (recv(udp_sock, drain, sizeof(drain), MSG_DONTWAIT) > 0);*/
                         }
 
                         struct PlaybackArgs *pa = malloc(sizeof(*pa));
@@ -819,7 +923,6 @@ int run(struct App *app, GC gc, int num_artists) {
 }
 
 
-
 int main(int argc, char *argv[]) {
     Window win;
     XEvent ev;
@@ -862,6 +965,23 @@ int main(int argc, char *argv[]) {
     connect_to_server(&app, argv[1], 1);
     //get_songlist(&app);
     receive_metadata(app.sock_fd, &app);
+
+    /*if (udp_sock < 0) {
+        udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_sock < 0) { perror("socket"); exit(1); }
+
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = 0;
+        if (bind(udp_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            perror("bind");
+            exit(1);
+        }
+        
+        int port = get_udp_port(udp_sock);
+        printf("[DEBUG] UDP socket created, bound to port %d\n", port);
+    }*/
 
     run(&app, gc, app.num_artists);
 
